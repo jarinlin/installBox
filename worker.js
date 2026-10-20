@@ -19,10 +19,10 @@
 // 得先唤醒：自动 POST /resume（stopped 的用 /start 兜底）→ 等 running → 再续租。
 // INSTABOX_AUTO_RESUME=0 可以关掉这个自愈。
 //
-// 每次续租都给 Telegram 发当前状态（成功或失败）。两个 secret：
+// Telegram 默认每小时汇总一次（北京时间），不跟每次续租走。两个 secret：
 //   TELEGRAM_BOT_TOKEN  BotFather 给的 token
 //   TELEGRAM_CHAT_ID    接收人的 chat id（群是负数）
-// INSTABOX_TG_MODE：every（默认，每 9 分钟一条）/ hourly / off
+// INSTABOX_TG_MODE：hourly（默认，上一小时的检测次数和状态）/ every / off
 const API_DEFAULT = "https://api.instabox.sh";
 const LEASE_DEFAULT = "keepalive";
 const TTL_DEFAULT = 300;
@@ -42,7 +42,7 @@ function cfg(env) {
     logMode: (env.INSTABOX_LOG_MODE || "hourly").trim(),
     tgToken: env.TELEGRAM_BOT_TOKEN || "",
     tgChat: (env.TELEGRAM_CHAT_ID || "").trim(),
-    tgMode: (env.INSTABOX_TG_MODE || "every").trim(),
+    tgMode: (env.INSTABOX_TG_MODE || "hourly").trim(),
   };
 }
 
@@ -207,7 +207,7 @@ async function keepalive(c, forceLog) {
 
 async function finish(c, out, forceLog) {
   if (out.machines) await logEvent(c, out, forceLog);
-  out.telegram = await notifyTelegram(c, out, forceLog);
+  out.telegram = await notifyTelegram(c, out);
   return out;
 }
 
@@ -224,6 +224,13 @@ function expiryText(iso) {
   return `${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())} ${p(t.getUTCHours())}:${p(t.getUTCMinutes())}`;
 }
 
+function beijingHour(iso) {
+  const d = new Date(iso || Date.now());
+  const t = new Date(d.getTime() + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${t.getUTCFullYear()}-${p(t.getUTCMonth() + 1)}-${p(t.getUTCDate())} ${p(t.getUTCHours())}`;
+}
+
 function machineLine(m) {
   if (m.ok) {
     const exp = m.expiresAt ? `，到期 ${expiryText(m.expiresAt)}` : "";
@@ -234,18 +241,8 @@ function machineLine(m) {
   return `· ${esc(m.machine || "?")} 失败 ${why}`;
 }
 
-async function notifyTelegram(c, out, force) {
-  if (!c.tgToken || !c.tgChat || c.tgMode === "off") return "unconfigured";
+function currentText(out) {
   const machines = out.machines || [];
-  const woken = machines.some((m) => m.resumed);
-  if (!force && out.ok && !woken && c.tgMode === "hourly" && c.kv) {
-    const hour = String(out.at).slice(0, 13);
-    try {
-      if ((await c.kv.get("tg:hour")) === hour) return "deduped";
-    } catch (e) {
-      console.log("instabox-keepalive: 读 TG 去重失败", e.message);
-    }
-  }
   const okCount = machines.filter((m) => m.ok).length;
   const lines = [];
   if (!machines.length) {
@@ -257,33 +254,111 @@ async function notifyTelegram(c, out, force) {
     lines.push(`InstaBox 续租 ${okCount}/${machines.length} 成功`);
   }
   for (const m of machines) lines.push(machineLine(m));
-  try {
-    const res = await fetch(`https://api.telegram.org/bot${c.tgToken}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: c.tgChat,
-        text: lines.join("\n"),
-        parse_mode: "HTML",
-      }),
-    });
-    if (!res.ok) {
-      const body = await res.text();
-      console.log("instabox-keepalive: TG 通知失败", res.status, body.slice(0, 200));
-      return "failed";
+  return lines.join("\n");
+}
+
+function summaryText(bucket) {
+  const [date, hh] = String(bucket.hour || "").split(" ");
+  const next = String((Number(hh) + 1) % 24).padStart(2, "0");
+  const lines = [
+    `InstaBox ${date} ${hh}:00–${next}:00`,
+    `检测 ${bucket.checks} 次，成功 ${bucket.ok} 次，失败 ${bucket.fail} 次`,
+  ];
+  const names = Object.keys(bucket.machines || {});
+  if (!names.length && bucket.lastError) lines.push(esc(bucket.lastError));
+  for (const name of names) {
+    const m = bucket.machines[name];
+    const total = (m.ok || 0) + (m.fail || 0);
+    if (m.lastOk) {
+      const exp = m.expiresAt ? `，到期 ${expiryText(m.expiresAt)}` : "";
+      const woke = m.resumed ? `，唤醒 ${m.resumed} 次` : "";
+      lines.push(`· ${esc(name)} ${m.ok}/${total} 成功${exp}${woke}`);
+    } else {
+      const why = m.error ? `，${esc(m.error)}` : "";
+      lines.push(`· ${esc(name)} ${m.ok}/${total} 成功，最近一次失败${why}`);
     }
-  } catch (e) {
-    console.log("instabox-keepalive: TG 通知失败", e.message);
+  }
+  return lines.join("\n");
+}
+
+async function sendTelegram(c, text) {
+  const res = await fetch(`https://api.telegram.org/bot${c.tgToken}/sendMessage`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ chat_id: c.tgChat, text, parse_mode: "HTML" }),
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    console.log("instabox-keepalive: TG 通知失败", res.status, body.slice(0, 200));
     return "failed";
   }
-  if (c.tgMode === "hourly" && c.kv && !woken) {
+  return "sent";
+}
+
+function emptyBucket(hour) {
+  return { hour, checks: 0, ok: 0, fail: 0, machines: {}, lastError: "" };
+}
+
+function addCheck(bucket, out) {
+  bucket.checks += 1;
+  if (out.ok) bucket.ok += 1;
+  else bucket.fail += 1;
+  const machines = out.machines || [];
+  if (!machines.length && out.error) bucket.lastError = String(out.error).slice(0, 200);
+  for (const m of machines) {
+    const name = m.machine || "?";
+    const cur = bucket.machines[name] || { ok: 0, fail: 0, lastOk: false, expiresAt: "", error: "", resumed: 0 };
+    if (m.ok) {
+      cur.ok += 1;
+      cur.lastOk = true;
+      cur.expiresAt = m.expiresAt || cur.expiresAt;
+      cur.error = "";
+    } else {
+      cur.fail += 1;
+      cur.lastOk = false;
+      cur.error = String(m.error || m.status || "").slice(0, 120);
+    }
+    if (m.resumed) cur.resumed += 1;
+    bucket.machines[name] = cur;
+  }
+}
+
+async function notifyTelegram(c, out) {
+  if (!c.tgToken || !c.tgChat || c.tgMode === "off") return "unconfigured";
+  if (c.tgMode === "every" || !c.kv) {
     try {
-      await c.kv.put("tg:hour", String(out.at).slice(0, 13), { expirationTtl: 7200 });
+      return await sendTelegram(c, currentText(out));
     } catch (e) {
-      console.log("instabox-keepalive: 写 TG 去重失败", e.message);
+      console.log("instabox-keepalive: TG 通知失败", e.message);
+      return "failed";
     }
   }
-  return "sent";
+  const hour = beijingHour(out.at);
+  let bucket = emptyBucket(hour);
+  let sent = "recorded";
+  try {
+    const raw = await c.kv.get("tg:bucket");
+    const prev = raw ? JSON.parse(raw) : null;
+    if (prev && prev.hour && prev.hour !== hour && prev.checks > 0) {
+      try {
+        sent = await sendTelegram(c, summaryText(prev));
+      } catch (e) {
+        console.log("instabox-keepalive: TG 通知失败", e.message);
+        sent = "failed";
+      }
+    } else if (prev && prev.hour === hour) {
+      bucket = prev;
+    }
+  } catch (e) {
+    console.log("instabox-keepalive: 读 TG 汇总失败", e.message);
+  }
+  addCheck(bucket, out);
+  try {
+    await c.kv.put("tg:bucket", JSON.stringify(bucket), { expirationTtl: 172800 });
+  } catch (e) {
+    console.log("instabox-keepalive: 写 TG 汇总失败", e.message);
+  }
+  return sent;
 }
 
 export default {

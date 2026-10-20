@@ -15,8 +15,8 @@ INSTABOX_LEASE_TTL = "900"
 INSTABOX_LOG_MODE = "hourly"
 # 机器被挂起或停掉时，先唤醒再续租。设为 0 则只报错
 INSTABOX_AUTO_RESUME = "1"
-# Telegram：every 每次续租都发状态；hourly 同一小时只发 1 条；off 不发
-INSTABOX_TG_MODE = "every"
+# Telegram：hourly 每小时汇总一次检测次数和状态；every 每次续租都发；off 不发
+INSTABOX_TG_MODE = "hourly"
 
 # 部署按钮会按这个绑定新建 KV，并换成新账号里的 id。不要填别人的 namespace id。
 [[kv_namespaces]]

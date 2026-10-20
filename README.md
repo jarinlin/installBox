@@ -2,7 +2,7 @@
 
 邀请制的 [InstaBox](https://instabox.sh) 机器空闲 30 分钟就会自动休眠，而且这个阈值锁在账号上，`instabox auto-suspend 0` 改不掉。这个 Worker 从 Cloudflare 外面每 9 分钟续一次官方的 activity lease，租约留 15 分钟，让 30 分钟的空闲计时攒不满。
 
-续完会往 Telegram 发一条当前状态。5 台都成功、或者其中几台失败，都会发。
+续租仍是每 9 分钟一次。Telegram 按北京时间每小时发一条，汇总这一小时检测了几次、成功几次，以及每台机器的结果。
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jarinlin/installBox)
 
@@ -25,7 +25,7 @@
 https://<你的worker>.workers.dev/?token=<TOKEN>
 ```
 
-返回里 `ok` 为 `true`、`telegram` 为 `sent`，就说明 机器续上了，Telegram 也发出去了。
+返回里 `ok` 为 `true` 就是这次续租成功。`telegram` 为 `recorded` 表示已经记进本小时汇总，要等下一个小时的第一次检测才会把上一小时发出去。
 
 ## 它具体做什么
 
@@ -33,7 +33,7 @@ https://<你的worker>.workers.dev/?token=<TOKEN>
 - 每次把租约重新设成 900 秒（15 分钟）。两次触发之间还叠着大约 6 分钟，某一次晚了或失败，不会马上开始计那 30 分钟
 - `INSTABOX_MACHINE` 留空时，续这把 key 名下的全部机器
 - 机器已经是休眠或关机时，先 `resume`（关机的再用 `start`），醒了再续租
-- 每次续租都发 Telegram。成功会列每台机器的到期时间（北京时间）；有失败会写成 `2/5 成功`，并带上原因
+- Telegram 每小时一条。内容是该小时的检测次数、成功次数、失败次数，以及每台机器成功了几次、最近一次到期时间。整点后的第一次检测发出上一小时的汇总
 
 机器要一直醒着才会一直计运行时间。暂停期间不计费，开着保活就等于放弃这件事。
 
@@ -43,7 +43,7 @@ https://<你的worker>.workers.dev/?token=<TOKEN>
 
 | 地址 | 作用 |
 | --- | --- |
-| `/` | 立刻续租一次，并按结果发 Telegram |
+| `/` | 立刻续租一次，并记入本小时汇总 |
 | `/status` | 看每台机器是运行还是休眠 |
 | `/log` | 最近 48 条续租记录 |
 | `/release` | 放掉租约。放掉之后，机器重新按 30 分钟空闲休眠 |
@@ -64,4 +64,4 @@ npx wrangler secret put TELEGRAM_CHAT_ID
 npx wrangler deploy
 ```
 
-不想每 9 分钟收一条 Telegram 时，把 `wrangler.toml` 里的 `INSTABOX_TG_MODE` 改成 `hourly`（同一小时只发一条）或 `off`。
+想改回每 9 分钟一条，把 `wrangler.toml` 里的 `INSTABOX_TG_MODE` 改成 `every`。改成 `off` 则不发 Telegram。
