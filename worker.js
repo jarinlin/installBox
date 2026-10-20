@@ -68,19 +68,38 @@ let cache = { key: "", list: [], at: 0 };
 
 async function machines(c) {
   const now = Date.now();
-  if (cache.key === c.machine && now - cache.at < 600_000) return cache.list;
+  if (cache.key === c.machine && now - cache.at < 600_000) return cache;
   let list = [];
+  let detail = "";
   if (c.machine.startsWith("m_")) {
     list = [{ id: c.machine, name: c.machine, state: "" }];
   } else if (c.machine) {
     const r = await call(c, "GET", `/v1/machines/${c.machine}`);
     if (r.ok && r.json?.id) list = [{ id: r.json.id, name: r.json.name || c.machine, state: r.json.state || "" }];
+    else detail = listDetail(r);
   } else {
-    const r = await call(c, "GET", "/v1/machines");
-    if (r.ok) list = (r.json?.machines || []).map((m) => ({ id: m.id, name: m.name, state: m.state || "" }));
+    let cursor = "";
+    do {
+      const path = "/v1/machines?limit=100" + (cursor ? `&cursor=${encodeURIComponent(cursor)}` : "");
+      const r = await call(c, "GET", path);
+      if (!r.ok) {
+        detail = listDetail(r);
+        break;
+      }
+      const page = r.json?.machines || [];
+      list.push(...page.map((m) => ({ id: m.id, name: m.name, state: m.state || "" })));
+      cursor = r.json?.nextCursor || "";
+      if (!list.length) detail = listDetail(r);
+    } while (cursor);
   }
-  cache = { key: c.machine, list, at: now };
-  return list;
+  cache = { key: c.machine, list, detail, at: now };
+  return cache;
+}
+
+function listDetail(r) {
+  const keys = r.json && typeof r.json === "object" ? Object.keys(r.json).join(",") : "";
+  const text = String(r.text || "").replace(/ibk_[A-Za-z0-9_-]+/g, "ibk_…").slice(0, 280);
+  return `HTTP ${r.status || 0}${keys ? " keys=" + keys : ""} ${text}`;
 }
 
 // 保活日志：绑了 KV（变量名 LOG）就留最近 48 条，没绑也能用，只是 /log 空
@@ -148,14 +167,16 @@ async function wakeThenLease(c, m) {
 
 async function keepalive(c, forceLog) {
   if (!c.key) return finish(c, { ok: false, at: new Date().toISOString(), error: "缺 INSTABOX_API_KEY" }, forceLog);
-  const list = await machines(c);
+  const found = await machines(c);
+  const list = found.list || [];
   if (!list.length) {
+    const why = found.detail ? `（${found.detail}）` : "";
     return finish(
       c,
       {
         ok: false,
         at: new Date().toISOString(),
-        error: c.machine ? `找不到机器 ${c.machine}（或 key 没权限）` : "这把 key 名下没有机器",
+        error: (c.machine ? `找不到机器 ${c.machine}（或 key 没权限）` : "这把 key 名下没有机器") + why,
       },
       forceLog,
     );
@@ -290,8 +311,9 @@ export default {
 
     if (route === "/status") {
       if (!c.key) return reply({ ok: false, error: "缺 INSTABOX_API_KEY" }, 502, asText);
-      const list = await machines(c);
-      if (!list.length) return reply({ ok: false, error: "没有机器" }, 502, asText);
+      const found = await machines(c);
+      const list = found.list || [];
+      if (!list.length) return reply({ ok: false, error: "没有机器", detail: found.detail || "" }, 502, asText);
       const machinesOut = [];
       for (const m of list) {
         const r = await call(c, "GET", `/v1/machines/${m.id}`);
@@ -325,7 +347,7 @@ export default {
     }
 
     if (route === "/release") {
-      const list = await machines(c);
+      const list = (await machines(c)).list || [];
       const out = [];
       for (const m of list) {
         const r = await call(c, "DELETE", `/v1/machines/${m.id}/activity-leases/${c.lease}`);
