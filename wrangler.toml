@@ -1,0 +1,24 @@
+name = "instabox-keepalive"
+main = "worker.js"
+compatibility_date = "2026-10-16"
+
+# 每 9 分钟续一次，租约留 15 分钟。TTL 必须大于 cron 间隔。
+[triggers]
+crons = ["*/9 * * * *"]
+
+[vars]
+# 留空 = 这把 API key 名下的全部机器
+INSTABOX_MACHINE = ""
+INSTABOX_LEASE = "keepalive"
+INSTABOX_LEASE_TTL = "900"
+# KV 日志：hourly 同一小时的连续成功只写 1 条；every 每次都写；off 不写
+INSTABOX_LOG_MODE = "hourly"
+# 机器被挂起或停掉时，先唤醒再续租。设为 0 则只报错
+INSTABOX_AUTO_RESUME = "1"
+# Telegram：every 每次续租都发状态；hourly 同一小时只发 1 条；off 不发
+INSTABOX_TG_MODE = "every"
+
+# 部署按钮会按这个绑定新建 KV，并换成新账号里的 id。不要填别人的 namespace id。
+[[kv_namespaces]]
+binding = "LOG"
+id = "00000000000000000000000000000000"

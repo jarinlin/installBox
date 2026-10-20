@@ -1,0 +1,23 @@
+{
+  "name": "installbox",
+  "private": true,
+  "cloudflare": {
+    "bindings": {
+      "INSTABOX_API_KEY": {
+        "description": "InstaBox API key，以 `ibk_` 开头。在 [API Keys](https://instabox.sh) 创建，权限至少要有 `machines:write`。"
+      },
+      "TOKEN": {
+        "description": "自己生成的一串随机字符。打开 Worker 时必须带 `?token=`，不带会返回 401。"
+      },
+      "TELEGRAM_BOT_TOKEN": {
+        "description": "Telegram [BotFather](https://t.me/BotFather) 给出的机器人 token。每次续租后用它发状态。"
+      },
+      "TELEGRAM_CHAT_ID": {
+        "description": "接收通知的 chat id。先给机器人发 `/start`，再打开 `https://api.telegram.org/bot<token>/getUpdates`，里面的 `chat.id` 就是。群 id 是负数。"
+      },
+      "LOG": {
+        "description": "保存最近 48 条续租记录。点部署时会自动新建这个 KV。"
+      }
+    }
+  }
+}

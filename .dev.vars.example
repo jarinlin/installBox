@@ -1,0 +1,5 @@
+# 部署到 Cloudflare 时会要求填写这些 Secret。不要把填好的文件提交进仓库。
+INSTABOX_API_KEY=
+TOKEN=
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
