@@ -124,6 +124,88 @@ async function logEvent(c, entry, force) {
 const lease = (c, id) =>
   call(c, "PUT", `/v1/machines/${id}/activity-leases/${c.lease}`, { ttlSeconds: c.ttl });
 
+// 成功续租后平台会冷却一段时间，这段里再 PUT 会被拒绝。等到期再请求，避免每轮都记失败。
+function cooldownAt(text) {
+  const raw = String(text || "");
+  let err = {};
+  try {
+    err = JSON.parse(raw).error || {};
+  } catch {}
+  const code = err.code || (raw.match(/"code":"([^"]+)"/) || [])[1] || "";
+  if (code !== "machine_cooldown" && !/cooling down/i.test(err.message || raw)) return 0;
+  const stamped = err.until || err.cooldownUntil
+    || ((err.message || raw).match(/until (\d{4}-\d{2}-\d{2}T[0-9:.]+Z)/) || [])[1];
+  const at = stamped ? Date.parse(stamped) : NaN;
+  if (Number.isFinite(at)) return at;
+  const retry = Number(err.retryAfterSeconds);
+  if (Number.isFinite(retry) && retry > 0) return Date.now() + retry * 1000;
+  return Date.now() + 60_000;
+}
+
+async function savedCool(c, id) {
+  if (!c.kv) return 0;
+  try {
+    const n = Number(await c.kv.get(`cool:${id}`));
+    return Number.isFinite(n) ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function rememberCool(c, id, at) {
+  if (!c.kv || !at) return;
+  const ttl = Math.max(60, Math.ceil((at - Date.now()) / 1000) + 120);
+  try {
+    await c.kv.put(`cool:${id}`, String(at), { expirationTtl: ttl });
+  } catch (e) {
+    console.log("instabox-keepalive: 写冷却时间失败", e.message);
+  }
+}
+
+async function rememberExpiry(c, id, expiresAt) {
+  if (!c.kv || !expiresAt) return;
+  try {
+    await c.kv.put(`exp:${id}`, expiresAt, { expirationTtl: 7200 });
+  } catch (e) {
+    console.log("instabox-keepalive: 写租约到期失败", e.message);
+  }
+}
+
+function shortError(raw) {
+  const text = String(raw || "");
+  try {
+    const err = JSON.parse(text).error;
+    if (err?.code === "machine_cooldown") return "冷却中";
+    if (err?.code && err?.message) return `${err.code}：${err.message}`.slice(0, 120);
+    if (err?.code) return err.code;
+  } catch {}
+  const code = (text.match(/"code":"([^"]+)"/) || [])[1];
+  return code || text.slice(0, 80);
+}
+
+// 冷却还没结束就别打续租。剩下不到 20 秒就等一下再试一次。
+async function leaseWhenReady(c, id) {
+  let until = await savedCool(c, id);
+  if (until > Date.now() + 20_000) return { cooldown: true, until };
+  if (until > Date.now()) await sleep(until - Date.now() + 400);
+  let r = await lease(c, id);
+  until = cooldownAt(r.text);
+  if (until) {
+    const wait = until - Date.now();
+    if (wait > 0 && wait <= 20_000) {
+      await sleep(wait + 400);
+      r = await lease(c, id);
+      until = cooldownAt(r.text);
+    }
+    if (until) {
+      await rememberCool(c, id, until);
+      return { cooldown: true, until };
+    }
+  }
+  if (r.ok && r.json?.expiresAt) await rememberExpiry(c, id, r.json.expiresAt);
+  return r;
+}
+
 // 409 machine_not_running：机器被平台挂起（suspended）或停掉了，续租对它是无效的
 const isNotRunning = (r) =>
   r.status === 409 && /not_running|suspended|stopped/i.test(r.text || "");
@@ -156,10 +238,11 @@ async function wakeThenLease(c, m) {
   for (let i = 0; i < 3; i++) {
     await sleep(5000);
     if ((await stateOf(c, m.id)) === "running") {
-      const r = await lease(c, m.id);
+      const r = await leaseWhenReady(c, m.id);
+      if (r.cooldown) return { ok: true, cooldown: true, until: new Date(r.until).toISOString(), resumed: true, wake };
       return r.ok
         ? { ok: true, resumed: true, expiresAt: r.json?.expiresAt, wake }
-        : { ok: false, resumed: true, status: r.status, error: r.text.slice(0, 200), wake };
+        : { ok: false, resumed: true, status: r.status, error: shortError(r.text), wake };
     }
   }
   return { ok: false, resumed: true, status: 409, error: "已发唤醒，机器还没 running（下一轮再续）", wake };
@@ -183,15 +266,17 @@ async function keepalive(c, forceLog) {
   }
   const results = [];
   for (const m of list) {
-    const r = await lease(c, m.id);
+    const r = await leaseWhenReady(c, m.id);
     const base = { machine: m.name, id: m.id };
-    if (r.ok) {
+    if (r.cooldown) {
+      results.push({ ...base, ok: true, cooldown: true, until: new Date(r.until).toISOString() });
+    } else if (r.ok) {
       results.push({ ...base, ok: true, expiresAt: r.json?.expiresAt });
     } else if (c.autoResume && isNotRunning(r)) {
       // 被挂起了：续租是空转，先把它弄醒再续
       results.push({ ...base, ...(await wakeThenLease(c, m)) });
     } else {
-      results.push({ ...base, ok: false, status: r.status, error: r.text.slice(0, 200) });
+      results.push({ ...base, ok: false, status: r.status, error: shortError(r.text) });
     }
   }
   const out = {
@@ -232,6 +317,10 @@ function beijingHour(iso) {
 }
 
 function machineLine(m) {
+  if (m.cooldown) {
+    const until = m.until ? `，到 ${expiryText(m.until)}` : "";
+    return `· ${esc(m.machine)} 冷却中，本次跳过${until}`;
+  }
   if (m.ok) {
     const exp = m.expiresAt ? `，到期 ${expiryText(m.expiresAt)}` : "";
     const how = m.resumed ? "唤醒后已续租" : "已续租";
@@ -269,13 +358,16 @@ function summaryText(bucket) {
   for (const name of names) {
     const m = bucket.machines[name];
     const total = (m.ok || 0) + (m.fail || 0);
-    if (m.lastOk) {
+    const cool = m.cool || 0;
+    const seen = total + cool;
+    const coolNote = cool ? `，冷却跳过 ${cool} 次${m.coolUntil ? `，到 ${expiryText(m.coolUntil)}` : ""}` : "";
+    if (m.lastOk || (!m.fail && cool)) {
       const exp = m.expiresAt ? `，到期 ${expiryText(m.expiresAt)}` : "";
       const woke = m.resumed ? `，唤醒 ${m.resumed} 次` : "";
-      lines.push(`· ${esc(name)} ${m.ok}/${total} 成功${exp}${woke}`);
+      lines.push(`· ${esc(name)} ${m.ok}/${seen} 成功${exp}${coolNote}${woke}`);
     } else {
       const why = m.error ? `，${esc(m.error)}` : "";
-      lines.push(`· ${esc(name)} ${m.ok}/${total} 成功，最近一次失败${why}`);
+      lines.push(`· ${esc(name)} ${m.ok}/${seen} 成功，最近一次失败${why}${coolNote}`);
     }
   }
   return lines.join("\n");
@@ -307,8 +399,11 @@ function addCheck(bucket, out) {
   if (!machines.length && out.error) bucket.lastError = String(out.error).slice(0, 200);
   for (const m of machines) {
     const name = m.machine || "?";
-    const cur = bucket.machines[name] || { ok: 0, fail: 0, lastOk: false, expiresAt: "", error: "", resumed: 0 };
-    if (m.ok) {
+    const cur = bucket.machines[name] || { ok: 0, fail: 0, cool: 0, lastOk: false, expiresAt: "", coolUntil: "", error: "", resumed: 0 };
+    if (m.cooldown) {
+      cur.cool += 1;
+      cur.coolUntil = m.until || cur.coolUntil;
+    } else if (m.ok) {
       cur.ok += 1;
       cur.lastOk = true;
       cur.expiresAt = m.expiresAt || cur.expiresAt;
@@ -316,7 +411,7 @@ function addCheck(bucket, out) {
     } else {
       cur.fail += 1;
       cur.lastOk = false;
-      cur.error = String(m.error || m.status || "").slice(0, 120);
+      cur.error = shortError(m.error || m.status || "");
     }
     if (m.resumed) cur.resumed += 1;
     bucket.machines[name] = cur;
