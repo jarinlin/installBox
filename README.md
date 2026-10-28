@@ -17,7 +17,7 @@
 | `TELEGRAM_BOT_TOKEN` | 在 Telegram 找 [@BotFather](https://t.me/BotFather)，发送 `/newbot` 拿到的 token |
 | `TELEGRAM_CHAT_ID` | 先给这个机器人发一句 `/start`，浏览器打开 `https://api.telegram.org/bot<token>/getUpdates`，JSON 里的 `chat.id` 就是。群的 id 是负数 |
 
-`LOG` 是存续租记录的 KV，点部署时会自动建，不用自己填 id。
+`LOG` 是存续租记录的 KV，点部署时会自动建，不用自己填 id。免费版每天最多写 1000 次。每次检查只写 1 条状态，日志按小时再写 1 条，一天大约 200 次。
 
 部署完成后打开：
 

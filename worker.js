@@ -142,33 +142,53 @@ function cooldownAt(text) {
   return Date.now() + 60_000;
 }
 
-async function savedCool(c, id) {
-  if (!c.kv) return 0;
+async function loadState(c) {
+  c.state = { cool: {}, exp: {}, bucket: null, _dirty: false };
+  if (!c.kv) return;
   try {
-    const n = Number(await c.kv.get(`cool:${id}`));
-    return Number.isFinite(n) ? n : 0;
-  } catch {
-    return 0;
+    const raw = await c.kv.get("state");
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    c.state.cool = saved.cool || {};
+    c.state.exp = saved.exp || {};
+    c.state.bucket = saved.bucket || null;
+  } catch (e) {
+    console.log("instabox-keepalive: 读状态失败", e.message);
   }
 }
 
-async function rememberCool(c, id, at) {
-  if (!c.kv || !at) return;
-  const ttl = Math.max(60, Math.ceil((at - Date.now()) / 1000) + 120);
+async function saveState(c) {
+  if (!c.kv || !c.state?._dirty) return;
+  const now = Date.now();
+  for (const id of Object.keys(c.state.cool)) {
+    if (Number(c.state.cool[id]) <= now) delete c.state.cool[id];
+  }
   try {
-    await c.kv.put(`cool:${id}`, String(at), { expirationTtl: ttl });
+    await c.kv.put("state", JSON.stringify({
+      cool: c.state.cool,
+      exp: c.state.exp,
+      bucket: c.state.bucket,
+    }), { expirationTtl: 172800 });
   } catch (e) {
-    console.log("instabox-keepalive: 写冷却时间失败", e.message);
+    console.log("instabox-keepalive: 写状态失败", e.message);
   }
 }
 
-async function rememberExpiry(c, id, expiresAt) {
-  if (!c.kv || !expiresAt) return;
-  try {
-    await c.kv.put(`exp:${id}`, expiresAt, { expirationTtl: 7200 });
-  } catch (e) {
-    console.log("instabox-keepalive: 写租约到期失败", e.message);
-  }
+function savedCool(c, id) {
+  const n = Number(c.state?.cool?.[id]);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function rememberCool(c, id, at) {
+  if (!c.state || !at) return;
+  c.state.cool[id] = at;
+  c.state._dirty = true;
+}
+
+function rememberExpiry(c, id, expiresAt) {
+  if (!c.state || !expiresAt) return;
+  c.state.exp[id] = expiresAt;
+  c.state._dirty = true;
 }
 
 function shortError(raw) {
@@ -185,7 +205,7 @@ function shortError(raw) {
 
 // 冷却还没结束就别打续租。剩下不到 20 秒就等一下再试一次。
 async function leaseWhenReady(c, id) {
-  let until = await savedCool(c, id);
+  let until = savedCool(c, id);
   if (until > Date.now() + 20_000) return { cooldown: true, until };
   if (until > Date.now()) await sleep(until - Date.now() + 400);
   let r = await lease(c, id);
@@ -198,11 +218,11 @@ async function leaseWhenReady(c, id) {
       until = cooldownAt(r.text);
     }
     if (until) {
-      await rememberCool(c, id, until);
+      rememberCool(c, id, until);
       return { cooldown: true, until };
     }
   }
-  if (r.ok && r.json?.expiresAt) await rememberExpiry(c, id, r.json.expiresAt);
+  if (r.ok && r.json?.expiresAt) rememberExpiry(c, id, r.json.expiresAt);
   return r;
 }
 
@@ -249,6 +269,7 @@ async function wakeThenLease(c, m) {
 }
 
 async function keepalive(c, forceLog) {
+  await loadState(c);
   if (!c.key) return finish(c, { ok: false, at: new Date().toISOString(), error: "缺 INSTABOX_API_KEY" }, forceLog);
   const found = await machines(c);
   const list = found.list || [];
@@ -293,6 +314,7 @@ async function keepalive(c, forceLog) {
 async function finish(c, out, forceLog) {
   if (out.machines) await logEvent(c, out, forceLog);
   out.telegram = await notifyTelegram(c, out);
+  await saveState(c);
   return out;
 }
 
@@ -431,27 +453,21 @@ async function notifyTelegram(c, out) {
   const hour = beijingHour(out.at);
   let bucket = emptyBucket(hour);
   let sent = "recorded";
-  try {
-    const raw = await c.kv.get("tg:bucket");
-    const prev = raw ? JSON.parse(raw) : null;
-    if (prev && prev.hour && prev.hour !== hour && prev.checks > 0) {
-      try {
-        sent = await sendTelegram(c, summaryText(prev));
-      } catch (e) {
-        console.log("instabox-keepalive: TG 通知失败", e.message);
-        sent = "failed";
-      }
-    } else if (prev && prev.hour === hour) {
-      bucket = prev;
+  const prev = c.state?.bucket;
+  if (prev && prev.hour && prev.hour !== hour && prev.checks > 0) {
+    try {
+      sent = await sendTelegram(c, summaryText(prev));
+    } catch (e) {
+      console.log("instabox-keepalive: TG 通知失败", e.message);
+      sent = "failed";
     }
-  } catch (e) {
-    console.log("instabox-keepalive: 读 TG 汇总失败", e.message);
+  } else if (prev && prev.hour === hour) {
+    bucket = prev;
   }
   addCheck(bucket, out);
-  try {
-    await c.kv.put("tg:bucket", JSON.stringify(bucket), { expirationTtl: 172800 });
-  } catch (e) {
-    console.log("instabox-keepalive: 写 TG 汇总失败", e.message);
+  if (c.state) {
+    c.state.bucket = bucket;
+    c.state._dirty = true;
   }
   return sent;
 }
